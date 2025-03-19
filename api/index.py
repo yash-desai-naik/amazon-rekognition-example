@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Body
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import boto3
@@ -6,7 +6,7 @@ import os
 import io
 from PIL import Image
 import uuid
-from typing import List, Optional
+from typing import List, Dict, Optional
 from pydantic import BaseModel
 
 app = FastAPI(
@@ -54,6 +54,14 @@ S3_BUCKET = os.environ.get("S3_BUCKET", "famouspersons-images-ca")
 COLLECTION_ID = os.environ.get("COLLECTION_ID", "famouspersons")
 DYNAMODB_TABLE = os.environ.get("DYNAMODB_TABLE", "face_recognition")
 
+# Verify DynamoDB table exists (helpful for debugging)
+try:
+    table_check = dynamodb.describe_table(TableName=DYNAMODB_TABLE)
+    print(f"DynamoDB table '{DYNAMODB_TABLE}' exists in region {AWS_REGION}")
+except Exception as e:
+    print(f"WARNING: DynamoDB table check failed: {str(e)}")
+    print(f"Make sure table '{DYNAMODB_TABLE}' exists in region {AWS_REGION}")
+
 # Pydantic models for responses
 class HealthResponse(BaseModel):
     status: str
@@ -74,6 +82,34 @@ class UploadResponse(BaseModel):
 
 class ErrorResponse(BaseModel):
     error: str
+
+# New models for group photo handling
+class DetectedFace(BaseModel):
+    face_id: str
+    bounding_box: Dict[str, float]
+    confidence: float
+
+class DetectFacesResponse(BaseModel):
+    image_id: str
+    face_count: int
+    faces: List[DetectedFace]
+
+class FaceNameMapping(BaseModel):
+    face_id: str
+    name: str
+
+class NameFacesRequest(BaseModel):
+    image_id: str
+    face_mappings: List[FaceNameMapping]
+
+class NameFacesResponse(BaseModel):
+    success: bool
+    named_faces: int
+
+class GroupPhotoDetails(BaseModel):
+    image_id: str
+    face_count: int
+    named_faces: List[Dict[str, str]]
 
 @app.get("/", response_model=HealthResponse)
 async def root():
@@ -220,15 +256,19 @@ async def list_faces():
     try:
         # Scan the DynamoDB table
         response = dynamodb.scan(
-            TableName=DYNAMODB_TABLE
+            TableName=DYNAMODB_TABLE,
+            FilterExpression="attribute_not_exists(SourceImageId) AND attribute_not_exists(FaceCount)"
         )
         
         faces = []
         for item in response.get('Items', []):
-            faces.append({
-                "face_id": item.get('RekognitionId', {}).get('S'),
-                "name": item.get('FullName', {}).get('S')
-            })
+            face_id = item.get('RekognitionId', {}).get('S')
+            # Skip group photo entries
+            if face_id and not face_id.startswith('IMG_'):
+                faces.append({
+                    "face_id": face_id,
+                    "name": item.get('FullName', {}).get('S')
+                })
         
         return {
             "faces": faces,
@@ -272,6 +312,218 @@ async def delete_face(face_id: str):
         return {
             "message": "Face deleted successfully",
             "face_id": face_id
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# New endpoints for group photo handling
+@app.post("/detect-faces", response_model=DetectFacesResponse, responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}})
+async def detect_faces(
+    image: UploadFile = File(...)
+):
+    """
+    Detect faces in a group photo without identifying them
+    
+    - **image**: Group photo with multiple faces
+    
+    Returns face IDs and their locations that can be named later
+    """
+    if not image.filename:
+        raise HTTPException(status_code=400, detail="No file provided")
+    
+    try:
+        # Read file contents
+        contents = await image.read()
+        
+        # Generate a unique ID for this image
+        image_id = str(uuid.uuid4())
+        file_path = f"group/{image_id}{os.path.splitext(image.filename)[1]}"
+        
+        # Upload to S3
+        s3.put_object(
+            Bucket=S3_BUCKET,
+            Key=file_path,
+            Body=contents
+        )
+        
+        # Detect faces with Amazon Rekognition
+        response = rekognition.index_faces(
+            Image={
+                "S3Object": {
+                    "Bucket": S3_BUCKET,
+                    "Name": file_path
+                }
+            },
+            CollectionId=COLLECTION_ID,
+            DetectionAttributes=['DEFAULT'],
+            MaxFaces=100  # Adjust as needed
+        )
+        
+        # Extract face data
+        faces = []
+        for face_record in response.get('FaceRecords', []):
+            face = face_record.get('Face', {})
+            faces.append(
+                DetectedFace(
+                    face_id=face.get('FaceId', ''),
+                    bounding_box=face.get('BoundingBox', {}),
+                    confidence=face.get('Confidence', 0.0)
+                )
+            )
+        
+        # Store image ID and path in DynamoDB for reference
+        dynamodb.put_item(
+            TableName=DYNAMODB_TABLE,
+            Item={
+                'RekognitionId': {'S': f"IMG_{image_id}"},
+                'FullName': {'S': "GROUP_PHOTO"},
+                'ImagePath': {'S': file_path},
+                'FaceCount': {'N': str(len(faces))}
+            }
+        )
+        
+        return {
+            "image_id": image_id,
+            "face_count": len(faces),
+            "faces": faces
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/name-faces", response_model=NameFacesResponse, responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}})
+async def name_faces(
+    request: NameFacesRequest
+):
+    """
+    Assign names to previously detected faces
+    
+    - **image_id**: ID of the previously uploaded group photo
+    - **face_mappings**: List of face IDs and corresponding names
+    
+    Returns confirmation of named faces
+    """
+    try:
+        # Get image reference
+        image_record = dynamodb.get_item(
+            TableName=DYNAMODB_TABLE,
+            Key={'RekognitionId': {'S': f"IMG_{request.image_id}"}}
+        )
+        
+        if 'Item' not in image_record:
+            raise HTTPException(
+                status_code=404, 
+                detail=f"Image with ID {request.image_id} not found"
+            )
+        
+        # Update names for each face ID
+        for mapping in request.face_mappings:
+            if not mapping.name:
+                continue  # Skip empty names
+                
+            dynamodb.put_item(
+                TableName=DYNAMODB_TABLE,
+                Item={
+                    'RekognitionId': {'S': mapping.face_id},
+                    'FullName': {'S': mapping.name},
+                    'SourceImageId': {'S': request.image_id}
+                }
+            )
+        
+        return {
+            "success": True,
+            "named_faces": len(request.face_mappings)
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/group-photos", responses={500: {"model": ErrorResponse}})
+async def list_group_photos():
+    """
+    List all uploaded group photos
+    
+    Returns basic information about all group photos
+    """
+    try:
+        # Scan the DynamoDB table for group photos
+        response = dynamodb.scan(
+            TableName=DYNAMODB_TABLE,
+            FilterExpression="begins_with(RekognitionId, :prefix)",
+            ExpressionAttributeValues={
+                ":prefix": {"S": "IMG_"}
+            }
+        )
+        
+        photos = []
+        for item in response.get('Items', []):
+            image_id = item.get('RekognitionId', {}).get('S', '')[4:]  # Remove 'IMG_' prefix
+            face_count = item.get('FaceCount', {}).get('N', '0')
+            image_path = item.get('ImagePath', {}).get('S', '')
+            
+            photos.append({
+                "image_id": image_id,
+                "face_count": int(face_count),
+                "image_path": image_path
+            })
+        
+        return {
+            "photos": photos,
+            "count": len(photos)
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/group-photos/{image_id}", response_model=GroupPhotoDetails, responses={404: {"model": ErrorResponse}, 500: {"model": ErrorResponse}})
+async def get_group_photo_details(image_id: str):
+    """
+    Get details of a previously uploaded group photo
+    
+    - **image_id**: ID of the group photo
+    
+    Returns the faces detected and their assigned names (if any)
+    """
+    try:
+        # Get image reference
+        image_record = dynamodb.get_item(
+            TableName=DYNAMODB_TABLE,
+            Key={'RekognitionId': {'S': f"IMG_{image_id}"}}
+        )
+        
+        if 'Item' not in image_record:
+            raise HTTPException(
+                status_code=404, 
+                detail=f"Image with ID {image_id} not found"
+            )
+            
+        # Get all faces from this image
+        # For a real app, you should use a secondary index in DynamoDB
+        # This is a simplified implementation
+        scan_response = dynamodb.scan(
+            TableName=DYNAMODB_TABLE,
+            FilterExpression="attribute_exists(SourceImageId) AND SourceImageId = :id",
+            ExpressionAttributeValues={
+                ":id": {"S": image_id}
+            }
+        )
+        
+        named_faces = []
+        for item in scan_response.get('Items', []):
+            named_faces.append({
+                "face_id": item.get('RekognitionId', {}).get('S', ''),
+                "name": item.get('FullName', {}).get('S', '')
+            })
+        
+        return {
+            "image_id": image_id,
+            "face_count": int(image_record['Item'].get('FaceCount', {}).get('N', '0')),
+            "named_faces": named_faces
         }
     
     except HTTPException:
