@@ -491,3 +491,9 @@ def get_matched_images(profile_id: str):
     except Exception as e:
         logger.error(f"Error in get_matched_images: {e}")
         return []
+    
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("index:app", host="0.0.0.0", port=8000, reload=True)
