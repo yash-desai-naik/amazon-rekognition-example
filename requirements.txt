@@ -1,14 +1,14 @@
 # API dependencies
-fastapi==0.104.1
-uvicorn==0.23.2
-boto3==1.28.68
-pillow==10.0.1
-python-multipart==0.0.6
-pydantic==2.4.2
+fastapi
+uvicorn
+boto3
+pillow
+python-multipart
+pydantic
 
 # Streamlit dashboard
-streamlit==1.27.0
-pandas==2.1.1
-requests==2.31.0
+streamlit
+pandas
+requests
 
 # pip install fastapi uvicorn boto3 pillow python-multipart pydantic streamlit pandas requests
