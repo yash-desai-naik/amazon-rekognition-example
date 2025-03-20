@@ -1,532 +1,493 @@
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Body
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import boto3
-import os
+from decimal import Decimal
 import io
-from PIL import Image
 import uuid
-from typing import List, Dict, Optional
-from pydantic import BaseModel
+from datetime import datetime
+from PIL import Image
+from typing import List, Optional
+from pydantic import BaseModel, Field
+import os
+import logging
+import json
 
-app = FastAPI(
-    title="Face Recognition API",
-    description="API for facial recognition using AWS Rekognition",
-    version="1.0.0"
-)
+from dotenv import load_dotenv
 
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
-    allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
-)
+load_dotenv(override=True)
 
-# Get AWS credentials from environment variables
-AWS_ACCESS_KEY = os.environ.get("AWS_ACCESS_KEY_ID")
-AWS_SECRET_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY")
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("api.index")
+
+# Config
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
-
-# AWS Service clients
-s3 = boto3.client(
-    's3',
-    aws_access_key_id=AWS_ACCESS_KEY,
-    aws_secret_access_key=AWS_SECRET_KEY,
-    region_name=AWS_REGION
-)
-rekognition = boto3.client(
-    'rekognition',
-    aws_access_key_id=AWS_ACCESS_KEY,
-    aws_secret_access_key=AWS_SECRET_KEY,
-    region_name=AWS_REGION
-)
-dynamodb = boto3.client(
-    'dynamodb',
-    aws_access_key_id=AWS_ACCESS_KEY,
-    aws_secret_access_key=AWS_SECRET_KEY,
-    region_name=AWS_REGION
-)
-
-# Configuration
 S3_BUCKET = os.environ.get("S3_BUCKET", "famouspersons-images-ca")
 COLLECTION_ID = os.environ.get("COLLECTION_ID", "famouspersons")
-DYNAMODB_TABLE = os.environ.get("DYNAMODB_TABLE", "face_recognition")
+PROFILES_TABLE = "profiles"
+DETECTED_FACES_TABLE = "detected_faces"
+FACE_RECOGNITION_TABLE = os.environ.get("DYNAMODB_TABLE", "facerecognition")
 
-# Verify DynamoDB table exists (helpful for debugging)
-try:
-    table_check = dynamodb.describe_table(TableName=DYNAMODB_TABLE)
-    print(f"DynamoDB table '{DYNAMODB_TABLE}' exists in region {AWS_REGION}")
-except Exception as e:
-    print(f"WARNING: DynamoDB table check failed: {str(e)}")
-    print(f"Make sure table '{DYNAMODB_TABLE}' exists in region {AWS_REGION}")
+app = FastAPI()
 
-# Pydantic models for responses
-class HealthResponse(BaseModel):
-    status: str
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-class FaceResult(BaseModel):
-    face_id: str
+# AWS clients
+s3 = boto3.client('s3', region_name=AWS_REGION)
+rekognition = boto3.client('rekognition', region_name=AWS_REGION)
+dynamodb = boto3.resource('dynamodb', region_name=AWS_REGION)
+
+# Data models
+class ProfileCreate(BaseModel):
     name: str
-    confidence: float
 
-class RecognizeResponse(BaseModel):
-    results: List[FaceResult]
-    count: int
+class Profile(BaseModel):
+    profile_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    name: str
+    face_id: Optional[str] = None
+    profile_image_s3: Optional[str] = None
+    created_at: str = Field(default_factory=lambda: datetime.now().isoformat())
 
-class UploadResponse(BaseModel):
-    message: str
-    face_id: str
-    full_name: str
-
-class ErrorResponse(BaseModel):
-    error: str
-
-# New models for group photo handling
 class DetectedFace(BaseModel):
-    face_id: str
-    bounding_box: Dict[str, float]
-    confidence: float
-
-class DetectFacesResponse(BaseModel):
+    detected_face_id: str
     image_id: str
-    face_count: int
-    faces: List[DetectedFace]
+    s3_path: str
+    matched_profile_id: Optional[str] = None
+    bounding_box: dict
+    confidence: Optional[float] = None
+    timestamp: str
 
-class FaceNameMapping(BaseModel):
-    face_id: str
-    name: str
+class ProfileResponse(Profile):
+    matched_images: List[str] = []
 
-class NameFacesRequest(BaseModel):
-    image_id: str
-    face_mappings: List[FaceNameMapping]
+class DetectedFaceResponse(DetectedFace):
+    pass
 
-class NameFacesResponse(BaseModel):
-    success: bool
-    named_faces: int
-
-class GroupPhotoDetails(BaseModel):
-    image_id: str
-    face_count: int
-    named_faces: List[Dict[str, str]]
-
-@app.get("/", response_model=HealthResponse)
-async def root():
-    """Root endpoint"""
-    return {"status": "Welcome to Face Recognition API"}
-
-@app.get("/health", response_model=HealthResponse)
-async def health_check():
-    """Health check endpoint"""
-    return {"status": "healthy"}
-
-@app.post("/upload", response_model=UploadResponse, responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}})
-async def upload_face(
-    image: UploadFile = File(...),
-    name: str = Form(...)
-):
-    """
-    Upload a face image with person name
+def create_dynamodb_tables():
+    """Create required DynamoDB tables if they don't exist"""
+    dynamodb_client = boto3.client('dynamodb', region_name=AWS_REGION)
     
-    - **image**: Image file containing a face
-    - **name**: Full name of the person
+    # Define table schemas
+    tables = {
+        PROFILES_TABLE: {
+            "KeySchema": [{'AttributeName': 'profile_id', 'KeyType': 'HASH'}],
+            "AttributeDefinitions": [{'AttributeName': 'profile_id', 'AttributeType': 'S'}]
+        },
+        DETECTED_FACES_TABLE: {
+            "KeySchema": [
+                {'AttributeName': 'detected_face_id', 'KeyType': 'HASH'},
+                {'AttributeName': 'image_id', 'KeyType': 'RANGE'}
+            ],
+            "AttributeDefinitions": [
+                {'AttributeName': 'detected_face_id', 'AttributeType': 'S'},
+                {'AttributeName': 'image_id', 'AttributeType': 'S'}
+            ]
+        },
+        FACE_RECOGNITION_TABLE: {
+            "KeySchema": [{'AttributeName': 'RekognitionId', 'KeyType': 'HASH'}],
+            "AttributeDefinitions": [{'AttributeName': 'RekognitionId', 'AttributeType': 'S'}]
+        }
+    }
     
-    Returns the face ID and confirmation message
-    """
-    if not image.filename:
-        raise HTTPException(status_code=400, detail="No file provided")
+    # Create tables that don't exist
+    for table_name, schema in tables.items():
+        try:
+            # Check if table exists
+            dynamodb_client.describe_table(TableName=table_name)
+            logger.info(f"Table {table_name} already exists")
+        except dynamodb_client.exceptions.ResourceNotFoundException:
+            try:
+                logger.info(f"Creating table {table_name}...")
+                dynamodb_client.create_table(
+                    TableName=table_name,
+                    KeySchema=schema["KeySchema"],
+                    AttributeDefinitions=schema["AttributeDefinitions"],
+                    ProvisionedThroughput={'ReadCapacityUnits': 5, 'WriteCapacityUnits': 5}
+                )
+                # Wait for table to be created
+                waiter = dynamodb_client.get_waiter('table_exists')
+                waiter.wait(TableName=table_name)
+                logger.info(f"Created table {table_name}")
+            except Exception as e:
+                logger.error(f"Error creating table {table_name}: {e}")
+
+def create_rekognition_collection():
+    """Create Rekognition collection if it doesn't exist"""
+    try:
+        rekognition.describe_collection(CollectionId=COLLECTION_ID)
+        logger.info(f"Rekognition collection {COLLECTION_ID} already exists")
+    except rekognition.exceptions.ResourceNotFoundException:
+        try:
+            rekognition.create_collection(CollectionId=COLLECTION_ID)
+            logger.info(f"Created Rekognition collection {COLLECTION_ID}")
+        except Exception as e:
+            logger.error(f"Error creating Rekognition collection: {e}")
+
+def get_s3_presigned_url(s3_uri, expiration=3600):
+    """Generate a pre-signed URL for S3 object"""
+    if not s3_uri or not s3_uri.startswith("s3://"):
+        return s3_uri
+    
+    bucket_key = s3_uri.replace("s3://", "").split("/", 1)
+    if len(bucket_key) != 2:
+        return s3_uri
+    
+    bucket, key = bucket_key
     
     try:
-        # Read file contents
-        contents = await image.read()
-        
-        # Generate a unique filename
-        filename = str(uuid.uuid4()) + os.path.splitext(image.filename)[1]
-        file_path = f"index/{filename}"
-        
-        # Upload to S3 with metadata
-        s3.put_object(
-            Bucket=S3_BUCKET,
-            Key=file_path,
-            Body=contents,
-            Metadata={'fullname': name}
+        url = s3.generate_presigned_url(
+            'get_object',
+            Params={'Bucket': bucket, 'Key': key},
+            ExpiresIn=expiration
         )
-        
-        # Index face with Amazon Rekognition
-        response = rekognition.index_faces(
-            Image={
-                "S3Object": {
-                    "Bucket": S3_BUCKET,
-                    "Name": file_path
-                }
-            },
-            CollectionId=COLLECTION_ID
-        )
-        
-        # Store face ID and full name in DynamoDB
-        if response['ResponseMetadata']['HTTPStatusCode'] == 200 and response['FaceRecords']:
-            face_id = response['FaceRecords'][0]['Face']['FaceId']
-            
-            dynamodb.put_item(
-                TableName=DYNAMODB_TABLE,
-                Item={
-                    'RekognitionId': {'S': face_id},
-                    'FullName': {'S': name}
-                }
-            )
-            
-            return {
-                "message": "Face indexed successfully",
-                "face_id": face_id,
-                "full_name": name
-            }
-        else:
-            raise HTTPException(status_code=500, detail="Failed to index face")
-    
+        return url
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error generating presigned URL: {e}")
+        return s3_uri
 
-@app.post("/recognize", response_model=RecognizeResponse, responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}})
-async def recognize_face(
-    image: UploadFile = File(...)
-):
-    """
-    Recognize a face from uploaded image
-    
-    - **image**: Image file containing a face to recognize
-    
-    Returns a list of matching faces with confidence scores
-    """
-    if not image.filename:
-        raise HTTPException(status_code=400, detail="No file provided")
-    
+@app.on_event("startup")
+async def startup():
+    """Initialize resources on startup"""
+    create_rekognition_collection()
+    create_dynamodb_tables()
+
+@app.get("/")
+async def root():
+    return {"message": "Face Recognition API is running"}
+
+@app.post("/upload_image", response_model=List[DetectedFaceResponse])
+async def upload_image(file: UploadFile = File(...), description: str = Form(None)):
+    """Upload a group image and detect faces"""
     try:
-        # Read file contents
-        contents = await image.read()
+        # Read image and upload to S3
+        image_content = await file.read()
+        image_id = str(uuid.uuid4())
+        s3_key = f"groups/{image_id}.jpg"
         
-        # Process the image
-        image_obj = Image.open(io.BytesIO(contents))
-        stream = io.BytesIO()
-        image_obj.save(stream, format="JPEG")
-        image_binary = stream.getvalue()
+        s3.upload_fileobj(io.BytesIO(image_content), S3_BUCKET, s3_key)
+        s3_uri = f"s3://{S3_BUCKET}/{s3_key}"
+        logger.info(f"Uploaded image to S3: {s3_uri}")
         
-        # Search for matching faces
-        response = rekognition.search_faces_by_image(
-            CollectionId=COLLECTION_ID,
-            Image={'Bytes': image_binary},
-            MaxFaces=5,
-            FaceMatchThreshold=80
+        # Detect faces
+        response = rekognition.detect_faces(
+            Image={'S3Object': {'Bucket': S3_BUCKET, 'Name': s3_key}},
+            Attributes=['DEFAULT']
         )
+        logger.info(f"Detected {len(response['FaceDetails'])} faces")
         
         results = []
-        for match in response['FaceMatches']:
-            face_id = match['Face']['FaceId']
-            confidence = match['Face']['Confidence']
-            
-            # Get person name from DynamoDB
-            face_data = dynamodb.get_item(
-                TableName=DYNAMODB_TABLE,
-                Key={'RekognitionId': {'S': face_id}}
-            )
-            
-            person_name = face_data.get('Item', {}).get('FullName', {}).get('S', 'Unknown')
-            
-            results.append({
-                "face_id": face_id,
-                "name": person_name,
-                "confidence": confidence
-            })
+        faces_table = dynamodb.Table(DETECTED_FACES_TABLE)
         
-        return {
-            "results": results,
-            "count": len(results)
-        }
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/faces", responses={500: {"model": ErrorResponse}})
-async def list_faces():
-    """
-    List all indexed faces in the collection
-    
-    Returns all faces with their IDs and names
-    """
-    try:
-        # Scan the DynamoDB table
-        response = dynamodb.scan(
-            TableName=DYNAMODB_TABLE,
-            FilterExpression="attribute_not_exists(SourceImageId) AND attribute_not_exists(FaceCount)"
-        )
-        
-        faces = []
-        for item in response.get('Items', []):
-            face_id = item.get('RekognitionId', {}).get('S')
-            # Skip group photo entries
-            if face_id and not face_id.startswith('IMG_'):
-                faces.append({
-                    "face_id": face_id,
-                    "name": item.get('FullName', {}).get('S')
-                })
-        
-        return {
-            "faces": faces,
-            "count": len(faces)
-        }
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.delete("/faces/{face_id}", responses={404: {"model": ErrorResponse}, 500: {"model": ErrorResponse}})
-async def delete_face(face_id: str):
-    """
-    Delete a face from the collection
-    
-    - **face_id**: ID of the face to delete
-    
-    Returns confirmation of deletion
-    """
-    try:
-        # Check if face exists
-        face_data = dynamodb.get_item(
-            TableName=DYNAMODB_TABLE,
-            Key={'RekognitionId': {'S': face_id}}
-        )
-        
-        if 'Item' not in face_data:
-            raise HTTPException(status_code=404, detail="Face not found")
-        
-        # Delete from Rekognition collection
-        rekognition.delete_faces(
-            CollectionId=COLLECTION_ID,
-            FaceIds=[face_id]
-        )
-        
-        # Delete from DynamoDB
-        dynamodb.delete_item(
-            TableName=DYNAMODB_TABLE,
-            Key={'RekognitionId': {'S': face_id}}
-        )
-        
-        return {
-            "message": "Face deleted successfully",
-            "face_id": face_id
-        }
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# New endpoints for group photo handling
-@app.post("/detect-faces", response_model=DetectFacesResponse, responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}})
-async def detect_faces(
-    image: UploadFile = File(...)
-):
-    """
-    Detect faces in a group photo without identifying them
-    
-    - **image**: Group photo with multiple faces
-    
-    Returns face IDs and their locations that can be named later
-    """
-    if not image.filename:
-        raise HTTPException(status_code=400, detail="No file provided")
-    
-    try:
-        # Read file contents
-        contents = await image.read()
-        
-        # Generate a unique ID for this image
-        image_id = str(uuid.uuid4())
-        file_path = f"group/{image_id}{os.path.splitext(image.filename)[1]}"
-        
-        # Upload to S3
-        s3.put_object(
-            Bucket=S3_BUCKET,
-            Key=file_path,
-            Body=contents
-        )
-        
-        # Detect faces with Amazon Rekognition
-        response = rekognition.index_faces(
-            Image={
-                "S3Object": {
-                    "Bucket": S3_BUCKET,
-                    "Name": file_path
-                }
-            },
-            CollectionId=COLLECTION_ID,
-            DetectionAttributes=['DEFAULT'],
-            MaxFaces=100  # Adjust as needed
-        )
-        
-        # Extract face data
-        faces = []
-        for face_record in response.get('FaceRecords', []):
-            face = face_record.get('Face', {})
-            faces.append(
-                DetectedFace(
-                    face_id=face.get('FaceId', ''),
-                    bounding_box=face.get('BoundingBox', {}),
-                    confidence=face.get('Confidence', 0.0)
+        for face_detail in response['FaceDetails']:
+            try:
+                # Index face in collection
+                index_response = rekognition.index_faces(
+                    CollectionId=COLLECTION_ID,
+                    Image={'S3Object': {'Bucket': S3_BUCKET, 'Name': s3_key}},
+                    MaxFaces=1,
+                    DetectionAttributes=['DEFAULT']
                 )
-            )
-        
-        # Store image ID and path in DynamoDB for reference
-        dynamodb.put_item(
-            TableName=DYNAMODB_TABLE,
-            Item={
-                'RekognitionId': {'S': f"IMG_{image_id}"},
-                'FullName': {'S': "GROUP_PHOTO"},
-                'ImagePath': {'S': file_path},
-                'FaceCount': {'N': str(len(faces))}
-            }
-        )
-        
-        return {
-            "image_id": image_id,
-            "face_count": len(faces),
-            "faces": faces
-        }
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/name-faces", response_model=NameFacesResponse, responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}})
-async def name_faces(
-    request: NameFacesRequest
-):
-    """
-    Assign names to previously detected faces
-    
-    - **image_id**: ID of the previously uploaded group photo
-    - **face_mappings**: List of face IDs and corresponding names
-    
-    Returns confirmation of named faces
-    """
-    try:
-        # Get image reference
-        image_record = dynamodb.get_item(
-            TableName=DYNAMODB_TABLE,
-            Key={'RekognitionId': {'S': f"IMG_{request.image_id}"}}
-        )
-        
-        if 'Item' not in image_record:
-            raise HTTPException(
-                status_code=404, 
-                detail=f"Image with ID {request.image_id} not found"
-            )
-        
-        # Update names for each face ID
-        for mapping in request.face_mappings:
-            if not mapping.name:
-                continue  # Skip empty names
                 
-            dynamodb.put_item(
-                TableName=DYNAMODB_TABLE,
-                Item={
-                    'RekognitionId': {'S': mapping.face_id},
-                    'FullName': {'S': mapping.name},
-                    'SourceImageId': {'S': request.image_id}
+                if not index_response['FaceRecords']:
+                    continue
+                
+                face_id = index_response['FaceRecords'][0]['Face']['FaceId']
+                
+                # Search for matching profiles
+                match_response = rekognition.search_faces(
+                    CollectionId=COLLECTION_ID,
+                    FaceId=face_id,
+                    MaxFaces=1,
+                    FaceMatchThreshold=90.0
+                )
+                
+                matched_profile_id = None
+                confidence = None
+                
+                if match_response['FaceMatches']:
+                    match = match_response['FaceMatches'][0]
+                    matched_face_id = match['Face']['FaceId']
+                    
+                    # Check if matched face belongs to a profile
+                    profiles_table = dynamodb.Table(PROFILES_TABLE)
+                    profile_response = profiles_table.scan(
+                        FilterExpression="face_id = :face_id",
+                        ExpressionAttributeValues={":face_id": matched_face_id}
+                    )
+                    
+                    if profile_response['Items']:
+                        matched_profile_id = profile_response['Items'][0]['profile_id']
+                        confidence = float(match['Similarity'])
+                
+                # Store face data in DynamoDB
+                timestamp = datetime.now().isoformat()
+                
+                # Convert floats to Decimal for DynamoDB
+                bounding_box = {}
+                for key, value in face_detail['BoundingBox'].items():
+                    bounding_box[key] = Decimal(str(value))
+                
+                face_item = {
+                    'detected_face_id': face_id,
+                    'image_id': image_id,
+                    's3_path': s3_uri,
+                    'bounding_box': bounding_box,
+                    'timestamp': timestamp
                 }
-            )
+                
+                if matched_profile_id:
+                    face_item['matched_profile_id'] = matched_profile_id
+                
+                if confidence:
+                    face_item['confidence'] = Decimal(str(confidence))
+                
+                faces_table.put_item(Item=face_item)
+                
+                # Create response object with HTTPS URL
+                face_response = DetectedFaceResponse(
+                    detected_face_id=face_id,
+                    image_id=image_id,
+                    s3_path=get_s3_presigned_url(s3_uri),
+                    matched_profile_id=matched_profile_id,
+                    bounding_box=face_detail['BoundingBox'],
+                    confidence=confidence,
+                    timestamp=timestamp
+                )
+                
+                results.append(face_response)
+            
+            except Exception as e:
+                logger.error(f"Error processing face: {e}")
         
-        return {
-            "success": True,
-            "named_faces": len(request.face_mappings)
+        return results
+    
+    except Exception as e:
+        logger.error(f"Error in upload_image: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/profiles", response_model=ProfileResponse)
+async def create_profile(name: str = Form(...), file: UploadFile = File(...)):
+    """Create a profile with a reference face image"""
+    try:
+        # Read image and upload to S3
+        image_content = await file.read()
+        profile_id = str(uuid.uuid4())
+        s3_key = f"profiles/{profile_id}.jpg"
+        
+        s3.upload_fileobj(io.BytesIO(image_content), S3_BUCKET, s3_key)
+        s3_uri = f"s3://{S3_BUCKET}/{s3_key}"
+        logger.info(f"Uploaded profile image to S3: {s3_uri}")
+        
+        # Index face
+        index_response = rekognition.index_faces(
+            CollectionId=COLLECTION_ID,
+            Image={'S3Object': {'Bucket': S3_BUCKET, 'Name': s3_key}},
+            MaxFaces=1,
+            DetectionAttributes=['DEFAULT']
+        )
+        
+        if not index_response['FaceRecords']:
+            raise HTTPException(status_code=400, detail="No face detected in the image")
+        
+        face_id = index_response['FaceRecords'][0]['Face']['FaceId']
+        logger.info(f"Indexed face with ID: {face_id}")
+        
+        # Create profile in DynamoDB
+        timestamp = datetime.now().isoformat()
+        profile_item = {
+            'profile_id': profile_id,
+            'name': name,
+            'face_id': face_id,
+            'profile_image_s3': s3_uri,
+            'created_at': timestamp
         }
+        
+        profiles_table = dynamodb.Table(PROFILES_TABLE)
+        profiles_table.put_item(Item=profile_item)
+        logger.info(f"Created profile: {profile_id}")
+        
+        # Match with existing faces
+        match_with_detected_faces(face_id, profile_id)
+        
+        # Get matched images
+        matched_images = get_matched_images(profile_id)
+        https_matched_images = [get_s3_presigned_url(img) for img in matched_images]
+        
+        # Return profile response
+        return ProfileResponse(
+            profile_id=profile_id,
+            name=name,
+            face_id=face_id,
+            profile_image_s3=get_s3_presigned_url(s3_uri),
+            created_at=timestamp,
+            matched_images=https_matched_images
+        )
     
     except HTTPException:
         raise
     except Exception as e:
+        logger.error(f"Error in create_profile: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/group-photos", responses={500: {"model": ErrorResponse}})
-async def list_group_photos():
-    """
-    List all uploaded group photos
-    
-    Returns basic information about all group photos
-    """
+@app.get("/profiles", response_model=List[ProfileResponse])
+async def get_profiles():
+    """Get all profiles"""
     try:
-        # Scan the DynamoDB table for group photos
-        response = dynamodb.scan(
-            TableName=DYNAMODB_TABLE,
-            FilterExpression="begins_with(RekognitionId, :prefix)",
-            ExpressionAttributeValues={
-                ":prefix": {"S": "IMG_"}
-            }
-        )
+        profiles_table = dynamodb.Table(PROFILES_TABLE)
+        response = profiles_table.scan()
         
-        photos = []
+        profiles = []
         for item in response.get('Items', []):
-            image_id = item.get('RekognitionId', {}).get('S', '')[4:]  # Remove 'IMG_' prefix
-            face_count = item.get('FaceCount', {}).get('N', '0')
-            image_path = item.get('ImagePath', {}).get('S', '')
-            
-            photos.append({
-                "image_id": image_id,
-                "face_count": int(face_count),
-                "image_path": image_path
-            })
+            try:
+                matched_images = get_matched_images(item['profile_id'])
+                https_matched_images = [get_s3_presigned_url(img) for img in matched_images]
+                
+                profile = ProfileResponse(
+                    profile_id=item['profile_id'],
+                    name=item['name'],
+                    face_id=item['face_id'],
+                    profile_image_s3=get_s3_presigned_url(item['profile_image_s3']),
+                    created_at=item['created_at'],
+                    matched_images=https_matched_images
+                )
+                profiles.append(profile)
+            except Exception as e:
+                logger.error(f"Error processing profile {item.get('profile_id')}: {e}")
         
-        return {
-            "photos": photos,
-            "count": len(photos)
-        }
+        return profiles
     
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error in get_profiles: {e}")
+        return []
 
-@app.get("/group-photos/{image_id}", response_model=GroupPhotoDetails, responses={404: {"model": ErrorResponse}, 500: {"model": ErrorResponse}})
-async def get_group_photo_details(image_id: str):
-    """
-    Get details of a previously uploaded group photo
-    
-    - **image_id**: ID of the group photo
-    
-    Returns the faces detected and their assigned names (if any)
-    """
+@app.get("/profiles/{profile_id}", response_model=ProfileResponse)
+async def get_profile(profile_id: str):
+    """Get a specific profile by ID"""
     try:
-        # Get image reference
-        image_record = dynamodb.get_item(
-            TableName=DYNAMODB_TABLE,
-            Key={'RekognitionId': {'S': f"IMG_{image_id}"}}
+        profiles_table = dynamodb.Table(PROFILES_TABLE)
+        response = profiles_table.get_item(Key={"profile_id": profile_id})
+        
+        if not response.get('Item'):
+            raise HTTPException(status_code=404, detail="Profile not found")
+        
+        item = response['Item']
+        matched_images = get_matched_images(profile_id)
+        https_matched_images = [get_s3_presigned_url(img) for img in matched_images]
+        
+        return ProfileResponse(
+            profile_id=item['profile_id'],
+            name=item['name'],
+            face_id=item['face_id'],
+            profile_image_s3=get_s3_presigned_url(item['profile_image_s3']),
+            created_at=item['created_at'],
+            matched_images=https_matched_images
         )
-        
-        if 'Item' not in image_record:
-            raise HTTPException(
-                status_code=404, 
-                detail=f"Image with ID {image_id} not found"
-            )
-            
-        # Get all faces from this image
-        # For a real app, you should use a secondary index in DynamoDB
-        # This is a simplified implementation
-        scan_response = dynamodb.scan(
-            TableName=DYNAMODB_TABLE,
-            FilterExpression="attribute_exists(SourceImageId) AND SourceImageId = :id",
-            ExpressionAttributeValues={
-                ":id": {"S": image_id}
-            }
-        )
-        
-        named_faces = []
-        for item in scan_response.get('Items', []):
-            named_faces.append({
-                "face_id": item.get('RekognitionId', {}).get('S', ''),
-                "name": item.get('FullName', {}).get('S', '')
-            })
-        
-        return {
-            "image_id": image_id,
-            "face_count": int(image_record['Item'].get('FaceCount', {}).get('N', '0')),
-            "named_faces": named_faces
-        }
     
     except HTTPException:
         raise
     except Exception as e:
+        logger.error(f"Error in get_profile: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/match_faces/{profile_id}", response_model=ProfileResponse)
+async def match_faces(profile_id: str):
+    """Force re-matching of a profile with detected faces"""
+    try:
+        profiles_table = dynamodb.Table(PROFILES_TABLE)
+        response = profiles_table.get_item(Key={"profile_id": profile_id})
+        
+        if not response.get('Item'):
+            raise HTTPException(status_code=404, detail="Profile not found")
+        
+        item = response['Item']
+        match_with_detected_faces(item['face_id'], profile_id)
+        
+        matched_images = get_matched_images(profile_id)
+        https_matched_images = [get_s3_presigned_url(img) for img in matched_images]
+        
+        return ProfileResponse(
+            profile_id=item['profile_id'],
+            name=item['name'],
+            face_id=item['face_id'],
+            profile_image_s3=get_s3_presigned_url(item['profile_image_s3']),
+            created_at=item['created_at'],
+            matched_images=https_matched_images
+        )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in match_faces: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+def match_with_detected_faces(face_id: str, profile_id: str):
+    """Match a profile face with detected faces"""
+    try:
+        # Search for matches in the collection
+        match_response = rekognition.search_faces(
+            CollectionId=COLLECTION_ID,
+            FaceId=face_id,
+            MaxFaces=100,
+            FaceMatchThreshold=80.0
+        )
+        
+        faces_table = dynamodb.Table(DETECTED_FACES_TABLE)
+        
+        # Update matched faces
+        for match in match_response.get('FaceMatches', []):
+            matched_face_id = match['Face']['FaceId']
+            confidence = Decimal(str(match['Similarity']))
+            
+            # Find detected faces with this ID
+            response = faces_table.scan(
+                FilterExpression="detected_face_id = :face_id",
+                ExpressionAttributeValues={":face_id": matched_face_id}
+            )
+            
+            for item in response.get('Items', []):
+                # Update with matched profile
+                faces_table.update_item(
+                    Key={
+                        "detected_face_id": matched_face_id,
+                        "image_id": item['image_id']
+                    },
+                    UpdateExpression="SET matched_profile_id = :pid, confidence = :conf",
+                    ExpressionAttributeValues={
+                        ":pid": profile_id,
+                        ":conf": confidence
+                    }
+                )
+        
+        logger.info(f"Matched profile {profile_id} with {len(match_response.get('FaceMatches', []))} faces")
+        return True
+    
+    except Exception as e:
+        logger.error(f"Error in match_with_detected_faces: {e}")
+        return False
+
+def get_matched_images(profile_id: str):
+    """Get images matched to a profile"""
+    try:
+        faces_table = dynamodb.Table(DETECTED_FACES_TABLE)
+        response = faces_table.scan(
+            FilterExpression="matched_profile_id = :pid",
+            ExpressionAttributeValues={":pid": profile_id}
+        )
+        
+        # Get unique image paths
+        image_paths = set()
+        for item in response.get('Items', []):
+            if 's3_path' in item:
+                image_paths.add(item['s3_path'])
+        
+        return list(image_paths)
+    
+    except Exception as e:
+        logger.error(f"Error in get_matched_images: {e}")
+        return []

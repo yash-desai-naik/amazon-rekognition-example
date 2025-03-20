@@ -10,3 +10,5 @@ pydantic==2.4.2
 streamlit==1.27.0
 pandas==2.1.1
 requests==2.31.0
+
+# pip install fastapi uvicorn boto3 pillow python-multipart pydantic streamlit pandas requests

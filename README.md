@@ -33,93 +33,156 @@ aws s3 mb s3://bucket-name --region us-east-1
 ```
 
 
----
-# Face Recognition API
+---# AWS Rekognition Face Recognition System
 
-A FastAPI application for facial recognition using AWS Rekognition, S3, and DynamoDB.
+This project provides a complete face recognition system using AWS Rekognition, with a FastAPI backend and Streamlit frontend.
 
-## Prerequisites
+## Features
 
+- Upload group photos with multiple faces
+- Automatically detect and index faces without requiring names during upload
+- Label faces with names after upload (batch naming workflow)
+- Group faces by person name/ID
+- Search for matching faces in new photos
+- View all detected faces grouped by person
+
+## Components
+
+1. **FastAPI Backend** - Handles all AWS service interactions
+2. **Streamlit Dashboard** - Provides a user-friendly interface
+3. **AWS Lambda Function** - Processes S3 uploads automatically
+4. **AWS Services Used**:
+   - Amazon Rekognition - Face detection and indexing
+   - Amazon S3 - Image storage
+   - Amazon DynamoDB - Face metadata storage
+
+## Project Structure
+
+```
+├── api/
+│   └── index.py        # FastAPI application
+├── app.py              # Streamlit dashboard
+├── lambda_function.py  # AWS Lambda handler
+├── vercel.json         # Vercel deployment configuration
+├── requirements.txt    # Python dependencies
+└── README.md           # This file
+```
+
+## Setup Instructions
+
+### Prerequisites
+
+- AWS Account with access to:
+  - S3
+  - DynamoDB
+  - Rekognition
+  - Lambda
 - Python 3.8+
-- AWS account with configured credentials
-- S3 bucket named 'famouspersons-images-ca'
-- DynamoDB table named 'face_recognition'
-- Rekognition collection named 'famouspersons'
+- Vercel account (for hosting the API)
 
-## Installation
+### AWS Setup
 
-1. Clone this repository
+1. **Create S3 Bucket**:
+   - Create a bucket named `famouspersons-images-ca` (or update the code with your bucket name)
+   - Configure CORS settings to allow API access
+
+2. **Create DynamoDB Table**:
+   - Table name: `face_recognition`
+   - Primary key: `RekognitionId` (String)
+
+3. **Create Rekognition Collection**:
+   - Collection ID: `famouspersons`
+   ```bash
+   aws rekognition create-collection --collection-id famouspersons
+   ```
+
+4. **Set up Lambda Function**:
+   - Create a new Lambda function
+   - Use the provided `lambda_function.py` as the handler
+   - Configure S3 bucket to trigger Lambda on object creation
+   - Attach IAM policy similar to the provided `policy.json`
+
+### API Setup
+
+1. Clone this repository:
+   ```bash
+   git clone <repository-url>
+   cd <repository-directory>
+   ```
+
 2. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-```bash
-pip install -r requirements.txt
-```
+3. Set environment variables:
+   ```bash
+   export AWS_ACCESS_KEY_ID=your-access-key
+   export AWS_SECRET_ACCESS_KEY=your-secret-key
+   export AWS_REGION=your-aws-region
+   export S3_BUCKET=famouspersons-images-ca
+   ```
 
-3. Configure AWS credentials:
+4. Deploy to Vercel:
+   ```bash
+   vercel
+   ```
 
-```bash
-aws configure
-```
+### Streamlit Dashboard Setup
 
-Or set environment variables:
+1. Install Streamlit and other requirements:
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-```bash
-export AWS_ACCESS_KEY_ID=your_access_key
-export AWS_SECRET_ACCESS_KEY=your_secret_key
-export AWS_DEFAULT_REGION=your_region
-```
+2. Set the API URL environment variable:
+   ```bash
+   export API_URL=https://your-vercel-deployment-url
+   ```
+
+3. Run the Streamlit app:
+   ```bash
+   streamlit run app.py
+   ```
 
 ## Usage
 
-1. Start the API server:
+### Upload Group Photos
 
-```bash
-uvicorn app:app --reload
-```
+1. Go to the "Upload & Process" tab
+2. Upload a group photo
+3. Click "Process Image" to detect and index faces
 
-2. Access the API documentation at http://localhost:8000/docs
+### Label Faces
 
-## API Endpoints
+1. Navigate to the "Label Faces" tab
+2. Click "Get Unnamed Faces" to see all unlabeled faces
+3. Select an image to work with
+4. Enter names for each detected face and click "Save"
 
-### Health Check
-```
-GET /health
-```
+### View Grouped Faces
 
-### Upload a Face
-```
-POST /upload
-Form data:
-- image: Image file
-- name: Full name of the person
-```
+1. Go to the "View Groups" tab
+2. Click "Load Grouped Faces" to see all faces grouped by name
 
-### Recognize a Face
-```
-POST /recognize
-Form data:
-- image: Image file
-```
+### Recognize New Faces
 
-### List All Faces
-```
-GET /faces
-```
+1. Use the sidebar uploader to upload a new image
+2. Click "Recognize Faces" to find matches with previously indexed faces
 
-### Delete a Face
-```
-DELETE /faces/{face_id}
-```
+## Customization
 
-## AWS Setup Notes
+- Update environment variables to use different AWS resources
+- Modify confidence thresholds in the API code to adjust face detection sensitivity
+- Enhance the Streamlit UI by adding more visualization features
 
-1. Make sure your IAM policy includes permissions for:
-   - S3 (GetObject, PutObject)
-   - DynamoDB (PutItem, GetItem, Scan, DeleteItem)
-   - Rekognition (IndexFaces, SearchFacesByImage, DeleteFaces)
+## Security Considerations
 
-2. The DynamoDB table should have 'RekognitionId' as the primary key
+- This demo uses environment variables for AWS credentials, which is not recommended for production
+- For production, use AWS IAM roles and secure credential management
+- Implement proper authentication and authorization for the API
+- Add validation for user inputs to prevent security issues
 
 ## License
 
-MIT
+[MIT License](LICENSE)

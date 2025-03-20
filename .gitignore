@@ -40,3 +40,5 @@ ENV/
 
 # AWS
 .aws/
+
+.venv
