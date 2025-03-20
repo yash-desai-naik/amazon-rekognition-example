@@ -11,4 +11,6 @@ streamlit
 pandas
 requests
 
+cowsay
+
 # pip install fastapi uvicorn boto3 pillow python-multipart pydantic streamlit pandas requests
