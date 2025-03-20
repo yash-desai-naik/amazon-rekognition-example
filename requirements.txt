@@ -5,6 +5,7 @@ boto3
 pillow
 python-multipart
 pydantic
+dotenv
 
 # # Streamlit dashboard
 # streamlit
