@@ -6,6 +6,6 @@ pillow
 python-multipart
 pydantic
 
-# Streamlit dashboard
-streamlit
-requests
+# # Streamlit dashboard
+# streamlit
+# requests
