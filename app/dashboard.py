@@ -6,7 +6,7 @@ import base64
 from io import BytesIO
 
 # API URL
-BASE_URL = "http://localhost:8000"  # Change this to your API URL
+BASE_URL = "https://face-match-ca.vercel.app"  # Change this to your API URL
 
 st.set_page_config(page_title="Face Recognition Demo", layout="wide")
 st.title("Face Recognition System")

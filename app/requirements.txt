@@ -1,0 +1,4 @@
+# # Streamlit dashboard
+streamlit
+requests
+dotenv
